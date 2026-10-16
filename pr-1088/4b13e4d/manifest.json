@@ -1,0 +1,29 @@
+{
+  "summary": "在 Agent 页新增 OpenClaw：接入后展开的详情里出现「配置模型」内联编辑器（主模型 + 可添加／删除／上下排序的降级模型，改完自动保存，写入失败保留原值），未安装时在「安装其他 Agent」中给出官方 shell/PowerShell 与 npm 安装命令，并使用官方彩色图标。",
+  "scenes": [
+    {
+      "title": "安装其他 Agent 里的 OpenClaw",
+      "shots": [
+        {
+          "file": "01-agents-install-collapsed.png",
+          "caption": "点击前：Agent 页底部的「安装其他 Agent」",
+          "width": 2168
+        },
+        {
+          "file": "02-agents-install-expanded.png",
+          "caption": "展开后的安装列表",
+          "width": 2168
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "沙盒里 OpenClaw 未安装（安装入口只列命令、不执行安装器，也不创建配置），Agent 列表中没有 OpenClaw 行，因此只有接入后才会出现的「配置模型」主模型／降级模型内联编辑器、它的添加／删除／上移按钮、非法输入与写入失败的报错、以及只读或 $include 配置的提示都无法在本次录像中出现；录像里只能看到「安装其他 Agent」中的 OpenClaw 安装命令入口。",
+  "interactive": true,
+  "pages": 1
+}
