@@ -72,6 +72,9 @@ type nsTidy struct {
 	named map[string]nsTool
 	sse   bool
 	buf   []byte
+	// grok is whether the model served is one of Grok's, whose calls carry
+	// integers written with a fraction of zeros ("limit":15.0)
+	grok bool
 }
 
 func (t *nsTidy) write(b []byte) []byte {
@@ -173,6 +176,6 @@ func (t *nsTidy) call(it map[string]any) bool {
 	if _, ok := t.named[name]; !ok {
 		return false
 	}
-	callTo(it, name, t.named)
+	callTo(it, name, t.named, t.grok)
 	return true
 }

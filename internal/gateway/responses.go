@@ -1498,6 +1498,9 @@ type responsesEncoder struct {
 	output   []any
 	col      collector
 	named    map[string]nsTool // the request's namespaced tools
+	// grok is whether the model served is one of Grok's, whose calls carry
+	// integers written with a fraction of zeros ("limit":15.0)
+	grok bool
 	// call is the open function_call item's id and name, kept here: the
 	// collector's last part isn't it once a hidden thinking block (signed
 	// with no text, or redacted) has come after the call (#1786)
@@ -1515,12 +1518,30 @@ type heldEvent struct {
 
 // callTo names the tool a function_call item is to as the client knows it:
 // a namespaced tool by its name and namespace, not the flat name the model
-// used.
-func callTo(item map[string]any, name string, named map[string]nsTool) map[string]any {
+// used. grok is whether the model served is one of Grok's, whose calls
+// carry integers written with a fraction of zeros.
+func callTo(item map[string]any, name string, named map[string]nsTool, grok bool) map[string]any {
 	if q := named[name]; q.Search {
 		// Codex runs its tool search itself, from the item it knows it by
 		args, _ := item["arguments"].(string)
+		if args == "" {
+			// an upstream that writes the arguments as an object, as the
+			// ChatGPT backend does; parseArgs takes them as text
+			if b, err := marshalPlain(item["arguments"]); err == nil {
+				args = string(b)
+			}
+		}
 		delete(item, "name")
+		if grok {
+			// Codex reads the search's integer arguments strictly and
+			// turns a whole number written with a fraction of zeros away
+			// ("failed to parse tool_search arguments: invalid number"),
+			// which leaves it without the tools it defers behind the
+			// search, spawn_agent and wait_agent among them. wholeArgs
+			// drops only that fraction (grok_integral.go), keeping 2.5
+			// and 2.5e3.
+			args = wholeArgs(args)
+		}
 		item["type"], item["execution"], item["arguments"] = "tool_search_call", "client", parseArgs(args)
 	} else if q.Custom {
 		// a custom tool's call carries its free-form input, not arguments
@@ -1662,9 +1683,9 @@ func (e *responsesEncoder) closeAs(sealed json.RawMessage) {
 		}
 		p := e.call
 		if q := e.named[p.Name]; !q.Search && !q.Custom {
-			e.send("response.function_call_arguments.done", callTo(map[string]any{"item_id": e.itemID, "output_index": e.item, "call_id": p.ID, "arguments": args}, p.Name, e.named))
+			e.send("response.function_call_arguments.done", callTo(map[string]any{"item_id": e.itemID, "output_index": e.item, "call_id": p.ID, "arguments": args}, p.Name, e.named, e.grok))
 		}
-		item = callTo(map[string]any{"id": e.itemID, "type": "function_call", "status": "completed", "call_id": p.ID, "arguments": args}, p.Name, e.named)
+		item = callTo(map[string]any{"id": e.itemID, "type": "function_call", "status": "completed", "call_id": p.ID, "arguments": args}, p.Name, e.named, e.grok)
 	}
 	e.send("response.output_item.done", map[string]any{"output_index": e.item, "item": item})
 	e.output = append(e.output, item)
@@ -1756,7 +1777,7 @@ func (e *responsesEncoder) event(ev Event) {
 		}
 		// Open (and so close the previous item) before recording this call:
 		// closeItem reads the previous call's id and name from e.call.
-		item := callTo(map[string]any{"type": "function_call", "call_id": ev.ID, "arguments": ""}, ev.Name, e.named)
+		item := callTo(map[string]any{"type": "function_call", "call_id": ev.ID, "arguments": ""}, ev.Name, e.named, e.grok)
 		e.openItem(ToolCall, itemPrefix(item), item)
 		e.call = Part{Kind: ToolCall, ID: ev.ID, Name: ev.Name}
 		e.col.add(ev)
@@ -1834,7 +1855,7 @@ func responsesSearchItem(query string, hits []Hit) map[string]any {
 }
 
 // renderResponses is the non-streaming reply.
-func renderResponses(res Result, model string, named map[string]nsTool) []byte {
+func renderResponses(res Result, model string, named map[string]nsTool, grok bool) []byte {
 	output := []any{}
 	for _, p := range res.Parts {
 		switch p.Kind {
@@ -1861,7 +1882,7 @@ func renderResponses(res Result, model string, named map[string]nsTool) []byte {
 				id = "call_" + newID()
 			}
 			item := callTo(map[string]any{"type": "function_call", "status": "completed",
-				"call_id": id, "arguments": argsString(p)}, p.Name, named)
+				"call_id": id, "arguments": argsString(p)}, p.Name, named, grok)
 			item["id"] = itemPrefix(item) + newID()
 			output = append(output, item)
 		case Search:

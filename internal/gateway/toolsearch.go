@@ -120,6 +120,10 @@ func marshalPlain(v any) ([]byte, error) {
 // pass as they came unless one carries such a call.
 type searchTidy struct {
 	buf []byte
+	// grok is whether the model served is one of Grok's, whose calls to
+	// the search carry integers written with a fraction of zeros
+	// ("limit":8.0); every other model's arguments are relayed as written
+	grok bool
 }
 
 func (t *searchTidy) write(b []byte) []byte {
@@ -128,18 +132,18 @@ func (t *searchTidy) write(b []byte) []byte {
 	if i < 0 {
 		return nil
 	}
-	out := searchLines(t.buf[:i+1])
+	out := t.searchLines(t.buf[:i+1])
 	t.buf = append(t.buf[:0], t.buf[i+1:]...)
 	return out
 }
 
 func (t *searchTidy) flush() []byte {
-	out := searchLines(t.buf)
+	out := t.searchLines(t.buf)
 	t.buf = nil
 	return out
 }
 
-func searchLines(b []byte) []byte {
+func (t *searchTidy) searchLines(b []byte) []byte {
 	if !bytes.Contains(b, []byte(`"tool_search"`)) {
 		return append([]byte(nil), b...)
 	}
@@ -151,12 +155,12 @@ func searchLines(b []byte) []byte {
 		} else {
 			b = nil
 		}
-		out = append(out, searchLine(line)...)
+		out = append(out, t.searchLine(line)...)
 	}
 	return out
 }
 
-func searchLine(line []byte) []byte {
+func (t *searchTidy) searchLine(line []byte) []byte {
 	if !bytes.Contains(line, []byte(`"tool_search"`)) {
 		return line
 	}
@@ -173,13 +177,13 @@ func searchLine(line []byte) []byte {
 		return line
 	}
 	changed := false
-	if it, _ := ev["item"].(map[string]any); searchCall(it) {
+	if it, _ := ev["item"].(map[string]any); t.searchCall(it) {
 		changed = true
 	}
 	if res, _ := ev["response"].(map[string]any); res != nil {
 		out, _ := res["output"].([]any)
 		for _, it := range out {
-			if im, _ := it.(map[string]any); searchCall(im) {
+			if im, _ := it.(map[string]any); t.searchCall(im) {
 				changed = true
 			}
 		}
@@ -196,12 +200,28 @@ func searchLine(line []byte) []byte {
 
 // searchCall makes a function_call to tool_search the tool_search_call it
 // stands for, and reports whether it was one.
-func searchCall(it map[string]any) bool {
+func (t *searchTidy) searchCall(it map[string]any) bool {
 	if it == nil || it["type"] != "function_call" || it["name"] != toolSearch || it["namespace"] != nil {
 		return false
 	}
 	args, _ := it["arguments"].(string)
+	if args == "" {
+		// an upstream that writes the arguments as an object, as the
+		// ChatGPT backend does; parseArgs takes them as text
+		if b, err := marshalPlain(it["arguments"]); err == nil {
+			args = string(b)
+		}
+	}
 	delete(it, "name")
+	if t.grok {
+		// Codex reads the search's integer arguments strictly and turns a
+		// whole number written with a fraction of zeros away ("failed to
+		// parse tool_search arguments: invalid number"), which leaves it
+		// without the tools it defers behind the search, spawn_agent and
+		// wait_agent among them. wholeArgs drops only that fraction
+		// (grok_integral.go), keeping 2.5 and 2.5e3.
+		args = wholeArgs(args)
+	}
 	it["type"], it["execution"], it["arguments"] = "tool_search_call", "client", parseArgs(args)
 	return true
 }

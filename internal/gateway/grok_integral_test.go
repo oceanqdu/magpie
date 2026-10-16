@@ -704,3 +704,259 @@ func TestGrokModel(t *testing.T) {
 		}
 	}
 }
+
+// searchRead is the arguments of the tool_search_call a reply carries, by
+// where a client reads it: the stream's argument deltas added up, its
+// output_item.done and completed, or a whole reply's output. Everything is
+// read off the reply's text, so that a number keeps the form it was
+// written in: a decoded one would be a float, and 2.5e3 would read back as
+// 2500.
+func searchRead(t *testing.T, body []byte, stream bool) map[string]string {
+	t.Helper()
+	read := map[string]string{}
+	keep := func(where string, items []json.RawMessage) {
+		for _, it := range items {
+			var im struct {
+				Type      string          `json:"type"`
+				Arguments json.RawMessage `json:"arguments"`
+			}
+			if json.Unmarshal(it, &im) != nil || im.Type != "tool_search_call" {
+				continue
+			}
+			if _, dup := read[where]; dup {
+				t.Fatalf("%s: two search calls: %s", where, body)
+			}
+			read[where] = argsText(im.Arguments)
+		}
+	}
+	if !stream {
+		var res struct {
+			Output []json.RawMessage `json:"output"`
+		}
+		if err := json.Unmarshal(body, &res); err != nil {
+			t.Fatalf("%v: %s", err, body)
+		}
+		keep("output", res.Output)
+		return read
+	}
+	var deltas strings.Builder
+	for _, line := range strings.Split(string(body), "\n") {
+		data, ok := strings.CutPrefix(strings.TrimSpace(line), "data:")
+		data = strings.TrimSpace(data)
+		if !ok || data == "" || data == "[DONE]" {
+			continue
+		}
+		var ev struct {
+			Type     string          `json:"type"`
+			Delta    string          `json:"delta"`
+			Item     json.RawMessage `json:"item"`
+			Response json.RawMessage `json:"response"`
+		}
+		if json.Unmarshal([]byte(data), &ev) != nil {
+			continue
+		}
+		switch ev.Type {
+		case "response.function_call_arguments.delta":
+			deltas.WriteString(ev.Delta)
+		case "response.output_item.done":
+			keep("output_item.done", []json.RawMessage{ev.Item})
+		case "response.completed":
+			var res struct {
+				Output []json.RawMessage `json:"output"`
+			}
+			if json.Unmarshal(ev.Response, &res) == nil {
+				keep("completed", res.Output)
+			}
+		}
+	}
+	read["deltas"] = deltas.String()
+	return read
+}
+
+// argsText is a call's arguments as they were written: an object as its
+// JSON, a string as what it holds.
+func argsText(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	return string(raw)
+}
+
+// searchWant is what a client reads of args: each field's value as written.
+func searchWant(t *testing.T, args string) map[string]string {
+	t.Helper()
+	return fieldsOf(t, args)
+}
+
+// searchArgsUp is a Responses upstream answering every request with one
+// tool_search_call whose arguments are args, written the way the upstream
+// writes them: as a string, or as an object. Streamed, its deltas are the
+// pieces and its done events carry them whole.
+func searchArgsUp(args string, obj bool, pieces []string) http.HandlerFunc {
+	written := func() string {
+		if obj {
+			return args
+		}
+		return quoted(args)
+	}
+	item := `{"type":"tool_search_call","id":"tsc_1","call_id":"s1","execution":"client","arguments":` + written() + `,"status":"completed"}`
+	done := `{"id":"resp_1","object":"response","status":"completed","model":"grok-4.6","output":[` + item + `],"usage":{"input_tokens":5,"output_tokens":3}}`
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/responses") {
+			http.NotFound(w, r)
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		var q map[string]any
+		json.Unmarshal(b, &q)
+		if q["stream"] != true {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, done)
+			return
+		}
+		lines := []string{
+			`event: response.created` + "\n" + `data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_1","object":"response","status":"in_progress","output":[]}}`,
+			`event: response.output_item.added` + "\n" + `data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"tool_search_call","id":"tsc_1","call_id":"s1","execution":"client","arguments":{},"status":"in_progress"}}`,
+		}
+		for _, p := range pieces {
+			lines = append(lines, `event: response.function_call_arguments.delta`+"\n"+`data: {"type":"response.function_call_arguments.delta","sequence_number":2,"item_id":"tsc_1","output_index":0,"delta":`+quoted(p)+`}`)
+		}
+		lines = append(lines,
+			`event: response.output_item.done`+"\n"+`data: {"type":"response.output_item.done","sequence_number":4,"output_index":0,"item":`+item+`}`,
+			`event: response.completed`+"\n"+`data: {"type":"response.completed","sequence_number":5,"response":`+done+`}`)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, sse(lines...))
+	}
+}
+
+// askSearchUp asks a relay for model, with the search in the tools so that
+// the model's call to the search comes back as the tool_search_call Codex
+// runs.
+func askSearchUp(t *testing.T, up http.HandlerFunc, model string, stream bool) []byte {
+	t.Helper()
+	fresh(t)
+	srv := httptest.NewServer(up)
+	t.Cleanup(srv.Close)
+	if err := provider.Save(provider.Provider{ID: "relay", Name: "Relay", Key: "k", Models: []string{model}, Responses: srv.URL + "/v1"}); err != nil {
+		t.Fatal(err)
+	}
+	return askGrok(t, "/v1/responses", `{"model":"relay/`+model+`","stream":`+strconv.FormatBool(stream)+`,`+searchTools+`,`+searchInput+`}`)
+}
+
+// checkSearch checks every place a client reads a search call, and that
+// the arguments there are want.
+func checkSearch(t *testing.T, body []byte, stream bool, want map[string]string) {
+	t.Helper()
+	read := searchRead(t, body, stream)
+	if len(read) == 0 {
+		t.Fatalf("stream %v: no search call: %s", stream, body)
+	}
+	for where, got := range read {
+		checkFields(t, where, got, want)
+	}
+}
+
+// checkFields checks the arguments read at where are want, field by field.
+func checkFields(t *testing.T, where, got string, want map[string]string) {
+	t.Helper()
+	fields := fieldsOf(t, got)
+	if len(fields) != len(want) {
+		t.Fatalf("%s: arguments %s, want %v", where, got, want)
+	}
+	for k, v := range want {
+		if fields[k] != v {
+			t.Fatalf("%s: %s is %s in %s, want %s", where, k, fields[k], got, v)
+		}
+	}
+}
+
+// Codex's tool search takes an integer limit, which Grok's models write
+// with a fraction of zeros ("limit":8.0) and Codex reads strictly, turning
+// the call away over it ("failed to parse tool_search arguments: invalid
+// number"), which leaves it without the tools the search defers,
+// spawn_agent and wait_agent among them. Codex reads integers everywhere
+// it reads the call, and the deltas add up to what its done events say.
+func TestGrokSearchGivesCodexIntegers(t *testing.T) {
+	args := `{"query":"calendar create","limit":8.0,"max_results":20.0,"depth":2.5}`
+	want := searchWant(t, args)
+	want["limit"], want["max_results"] = "8", "20"
+	pieces := []string{`{"query":"calendar crea`, `te","limit":8.0,"max_re`, `sults":20.0,"depth":2.5}`}
+	for _, stream := range []bool{true, false} {
+		for _, obj := range []bool{false, true} {
+			checkSearch(t, askSearchUp(t, searchArgsUp(args, obj, pieces), "grok-4.6", stream), stream, want)
+		}
+	}
+}
+
+// A search call streamed in deltas of 8.0, whose done event carries
+// arguments longer than the tidied deltas, still reads as an integer: the
+// tidy runs on the stream before pickArgs chooses between them, so the
+// longer raw 8.0 never wins it back.
+func TestGrokSearchDeltasBeatTheLongerDone(t *testing.T) {
+	args := `{"query":"mail","limit":8.0,"namespace":"mcp__cal","depth":2.5}`
+	// the done event's arguments, longer than the tidied deltas
+	whole := `{"query":"mail","limit":8.0,"namespace":"mcp__cal","depth":2.5,"note":"longer than the deltas"}`
+	tidied := `{"query":"mail","limit":8,"namespace":"mcp__cal","depth":2.5}`
+	if len(whole) <= len(tidied) {
+		t.Fatalf("the done event's arguments are not longer than the tidied deltas")
+	}
+	up := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, sse(
+			`event: response.created`+"\n"+`data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_1","object":"response","status":"in_progress","output":[]}}`,
+			`event: response.output_item.added`+"\n"+`data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"tool_search_call","id":"tsc_1","call_id":"s1","execution":"client","arguments":{},"status":"in_progress"}}`,
+			`event: response.function_call_arguments.delta`+"\n"+`data: {"type":"response.function_call_arguments.delta","sequence_number":2,"item_id":"tsc_1","output_index":0,"delta":`+quoted(args)+`}`,
+			`event: response.output_item.done`+"\n"+`data: {"type":"response.output_item.done","sequence_number":4,"output_index":0,"item":{"type":"tool_search_call","id":"tsc_1","call_id":"s1","execution":"client","arguments":`+quoted(whole)+`,"status":"completed"}}`,
+			`event: response.completed`+"\n"+`data: {"type":"response.completed","sequence_number":5,"response":{"id":"resp_1","object":"response","status":"completed","output":[{"type":"tool_search_call","id":"tsc_1","call_id":"s1","execution":"client","arguments":`+quoted(whole)+`}],"usage":{"input_tokens":5,"output_tokens":3}}}`))
+	}
+	want := searchWant(t, whole)
+	want["limit"] = "8"
+	body := askSearchUp(t, up, "grok-4.6", true)
+	// the deltas are the shorter arguments, tidied: what the done events
+	// carry is longer, so pickArgs takes those
+	read := searchRead(t, body, true)
+	for _, where := range []string{"output_item.done", "completed"} {
+		got, ok := read[where]
+		if !ok {
+			t.Fatalf("%s: no search call: %s", where, body)
+		}
+		checkFields(t, where, got, want)
+	}
+	deltas := searchWant(t, args)
+	deltas["limit"] = "8"
+	checkFields(t, "deltas", read["deltas"], deltas)
+}
+
+// A search call whose arguments the upstream wrote as an object, as the
+// ChatGPT backend does, has its integers too: there is no string form to
+// keep, so the object is read back as JSON.
+func TestGrokSearchObjectGivesCodexIntegers(t *testing.T) {
+	args := `{"query":"mail","limit":15.0,"depth":2.5}`
+	want := searchWant(t, args)
+	want["limit"] = "15"
+	for _, stream := range []bool{true, false} {
+		checkSearch(t, askSearchUp(t, searchArgsUp(args, true, []string{args}), "grok-4.6", stream), stream, want)
+	}
+}
+
+// What is not a fraction of zeros is left as the model wrote it: a real
+// fraction, and a number under an exponent.
+func TestGrokSearchKeepsItsOtherNumbers(t *testing.T) {
+	args := `{"query":"mail","limit":8.0,"depth":2.5,"big":2.5e3,"exp":1.0e3}`
+	want := searchWant(t, args)
+	want["limit"] = "8"
+	for _, stream := range []bool{true, false} {
+		checkSearch(t, askSearchUp(t, searchArgsUp(args, true, []string{args}), "grok-4.6", stream), stream, want)
+	}
+}
+
+// Another vendor's model is not Grok's: the same search reaches the client
+// as it came, its 8.0 untouched.
+func TestOnlyGrokSearchGetsIntegers(t *testing.T) {
+	args := `{"query":"mail","limit":8.0,"depth":2.5}`
+	want := searchWant(t, args)
+	for _, stream := range []bool{true, false} {
+		checkSearch(t, askSearchUp(t, searchArgsUp(args, true, []string{args}), "gpt-5.5", stream), stream, want)
+	}
+}

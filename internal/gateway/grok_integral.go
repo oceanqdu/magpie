@@ -160,11 +160,11 @@ func wholeResult(res Result) Result {
 }
 
 // intTidy drops, in a Grok model's reply relayed as it came, the zero
-// fractions of its calls' arguments: Responses' function_call items and
-// argument deltas, Chat's tool_calls, and Messages' tool_use input. A
-// stream's lines pass as they came unless one carries arguments that
-// change; a reply that isn't one is held whole and gone through at the
-// end.
+// fractions of its calls' arguments: Responses' function_call and
+// tool_search_call items and argument deltas, Chat's tool_calls, and
+// Messages' tool_use input. A stream's lines pass as they came unless one
+// carries arguments that change; a reply that isn't one is held whole and
+// gone through at the end.
 type intTidy struct {
 	proto provider.Protocol
 	sse   bool
@@ -202,7 +202,9 @@ func (t *intTidy) flush() []byte {
 func (t *intTidy) carries(b []byte) bool {
 	switch t.proto {
 	case provider.Responses:
-		return bytes.Contains(b, []byte(`function_call`))
+		// a search call's arguments are written as an object, so its line
+		// carries no "function_call" at all
+		return bytes.Contains(b, []byte(`function_call`)) || bytes.Contains(b, []byte(`tool_search_call`))
 	case provider.Chat:
 		return bytes.Contains(b, []byte(`"tool_calls"`))
 	case provider.Anthropic:
@@ -294,10 +296,34 @@ func set(m map[string]any, k string, f func(string) string) bool {
 	return false
 }
 
+// setObj writes m[k], arguments written as a JSON object rather than as a
+// string, through wholeArgs, and says whether that changed them. The
+// object has no text of its own to keep, so it is read back as JSON.
+func setObj(m map[string]any, k string) bool {
+	o, ok := m[k].(map[string]any)
+	if !ok {
+		return false
+	}
+	in, err := marshalPlain(o)
+	if err != nil {
+		return false
+	}
+	if out := wholeArgs(string(in)); out != string(in) {
+		m[k] = json.RawMessage(out)
+		return true
+	}
+	return false
+}
+
 func (t *intTidy) responses(ev map[string]any) bool {
 	changed := false
 	item := func(it map[string]any) {
-		if it != nil && it["type"] == "function_call" && set(it, "arguments", wholeArgs) {
+		if it == nil || it["type"] != "function_call" && it["type"] != "tool_search_call" {
+			return
+		}
+		// a search call's arguments are an object; a function call's are a
+		// string
+		if set(it, "arguments", wholeArgs) || setObj(it, "arguments") {
 			changed = true
 		}
 	}
@@ -390,12 +416,7 @@ func (t *intTidy) anthropic(ev map[string]any) bool {
 		if b == nil || b["type"] != "tool_use" || b["input"] == nil {
 			return
 		}
-		in, err := marshalPlain(b["input"])
-		if err != nil {
-			return
-		}
-		if out := wholeArgs(string(in)); out != string(in) {
-			b["input"] = json.RawMessage(out)
+		if setObj(b, "input") {
 			changed = true
 		}
 	}

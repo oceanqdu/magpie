@@ -120,7 +120,7 @@ func TestRenderedMessagesSayPhase(t *testing.T) {
 	var out struct {
 		Output []map[string]any `json:"output"`
 	}
-	if err := json.Unmarshal(renderResponses(res, "m", nil), &out); err != nil {
+	if err := json.Unmarshal(renderResponses(res, "m", nil, false), &out); err != nil {
 		t.Fatal(err)
 	}
 	if out.Output[0]["phase"] != "commentary" {
@@ -128,7 +128,7 @@ func TestRenderedMessagesSayPhase(t *testing.T) {
 	}
 	res = Result{Stop: "stop", Parts: []Part{{Kind: Text, Text: "Done."}}}
 	out.Output = nil
-	if err := json.Unmarshal(renderResponses(res, "m", nil), &out); err != nil {
+	if err := json.Unmarshal(renderResponses(res, "m", nil, false), &out); err != nil {
 		t.Fatal(err)
 	}
 	if out.Output[0]["phase"] != "final_answer" {

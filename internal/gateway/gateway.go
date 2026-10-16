@@ -4411,11 +4411,11 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	}
 	var search *searchTidy
 	if searchFn && sse {
-		search = &searchTidy{}
+		search = &searchTidy{grok: grokModel(model) || grokModel(upstream)}
 	}
 	var spaces *nsTidy
 	if named != nil {
-		spaces = &nsTidy{named: named, sse: sse}
+		spaces = &nsTidy{named: named, sse: sse, grok: grokModel(model) || grokModel(upstream)}
 	}
 	// a Grok model's 2500.0 in a call's arguments, which Codex turns away
 	// (grok_integral.go, #1431); any other model's reply goes as it came
@@ -5813,7 +5813,7 @@ func makeEncoder(proto provider.Protocol, w *sseWriter, r *Request) streamEncode
 	case provider.Chat:
 		return &chatEncoder{w: w, model: model}
 	case provider.Responses:
-		return &responsesEncoder{w: w, model: model, named: r.Namespaced}
+		return &responsesEncoder{w: w, model: model, named: r.Namespaced, grok: r.Grok}
 	case provider.Gemini:
 		return &geminiEncoder{w: w, model: model}
 	}
@@ -5830,7 +5830,7 @@ func render(proto provider.Protocol, res Result, r *Request) []byte {
 	case provider.Chat:
 		return renderChat(res, model)
 	case provider.Responses:
-		return renderResponses(res, model, r.Namespaced)
+		return renderResponses(res, model, r.Namespaced, r.Grok)
 	case provider.Gemini:
 		return renderGemini(res, model)
 	}

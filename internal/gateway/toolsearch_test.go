@@ -71,7 +71,7 @@ func TestToolSearchTranslated(t *testing.T) {
 // The model's call to the search goes back to Codex as the
 // tool_search_call Codex runs, with its arguments as an object.
 func TestToolSearchCallStreamedAndRendered(t *testing.T) {
-	req := &Request{Model: "m", Namespaced: map[string]nsTool{"tool_search": {Search: true}}}
+	req := &Request{Model: "grok-4.7", Grok: true, Namespaced: map[string]nsTool{"tool_search": {Search: true}}}
 	rec := httptest.NewRecorder()
 	enc := encoder(provider.Responses, newSSEWriter(rec), req)
 	enc.event(Event{Kind: KToolStart, ID: "s2", Name: "tool_search"})
@@ -254,5 +254,213 @@ func TestSearchTidySplit(t *testing.T) {
 			!strings.Contains(got, `"delta":"tool_search <b>"`) || !strings.HasPrefix(got, "event: response.output_item.done\n\n") {
 			t.Fatalf("cut at %d: %s", cut, got)
 		}
+	}
+}
+
+// literals is each value of an item's arguments as it was written: a
+// number's literal, so 15 is told from the 15.0 Codex refuses.
+func literals(t *testing.T, args json.RawMessage) map[string]string {
+	t.Helper()
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(args, &m); err != nil {
+		t.Fatalf("%v: %s", err, args)
+	}
+	out := map[string]string{}
+	for k, v := range m {
+		out[k] = string(v)
+	}
+	return out
+}
+
+// A Grok model writes the search's whole numbers with a fraction of zeros
+// ("limit":15.0), which Codex refuses ("failed to parse tool_search
+// arguments: invalid number", #1431). Codex reads the search's limit as an
+// integer wherever it reads the call: streamed and rendered whole.
+func TestToolSearchCallKeepsIntegers(t *testing.T) {
+	req := &Request{Model: "grok-4.7", Grok: true, Namespaced: map[string]nsTool{"tool_search": {Search: true}}}
+	rec := httptest.NewRecorder()
+	enc := encoder(provider.Responses, newSSEWriter(rec), req)
+	enc.event(Event{Kind: KToolStart, ID: "s4", Name: "tool_search"})
+	enc.event(Event{Kind: KToolArgs, Text: `{"query":"calendar","limit":15.0}`})
+	enc.finish()
+	var items []map[string]json.RawMessage
+	for _, ev := range itemsOf(t, rec.Body.String()) {
+		if ev.Type == "response.output_item.done" {
+			items = append(items, ev.Item)
+		}
+	}
+	if len(items) != 1 {
+		t.Fatalf("items = %v", items)
+	}
+	done := items[0]
+	if string(done["type"]) != `"tool_search_call"` || string(done["execution"]) != `"client"` || done["name"] != nil ||
+		literals(t, done["arguments"])["limit"] != "15" || literals(t, done["arguments"])["query"] != `"calendar"` {
+		t.Fatalf("streamed = %v", done)
+	}
+
+	res := Result{Parts: []Part{{Kind: ToolCall, ID: "s5", Name: "tool_search", Args: json.RawMessage(`{"query":"calendar","limit":15.0}`)}}}
+	var out struct {
+		Output []map[string]json.RawMessage `json:"output"`
+	}
+	if err := json.Unmarshal(render(provider.Responses, res, req), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Output) != 1 || string(out.Output[0]["type"]) != `"tool_search_call"` ||
+		literals(t, out.Output[0]["arguments"])["limit"] != "15" {
+		t.Fatalf("rendered = %v", out.Output)
+	}
+}
+
+// The fraction of zeros is the only one dropped: a real decimal and an
+// exponent reach Codex as the model wrote them, and another tool's
+// arguments are not the search's.
+func TestToolSearchCallKeepsFractionsAndExponents(t *testing.T) {
+	req := &Request{Model: "grok-4.7", Grok: true, Namespaced: map[string]nsTool{
+		"tool_search":  {Search: true},
+		"exec_command": {Name: "exec_command"},
+	}}
+	res := Result{Parts: []Part{
+		{Kind: ToolCall, ID: "s6", Name: "tool_search", Args: json.RawMessage(`{"query":"calendar","limit":2.5,"after":2.5e3,"size":8.0}`)},
+		{Kind: ToolCall, ID: "c3", Name: "exec_command", Args: json.RawMessage(`{"cmd":"sleep 2.0"}`)},
+	}}
+	var out struct {
+		Output []map[string]json.RawMessage `json:"output"`
+	}
+	if err := json.Unmarshal(render(provider.Responses, res, req), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Output) != 2 {
+		t.Fatalf("rendered = %v", out.Output)
+	}
+	got := literals(t, out.Output[0]["arguments"])
+	if string(out.Output[0]["type"]) != `"tool_search_call"` || got["limit"] != "2.5" ||
+		got["after"] != "2.5e3" || got["size"] != "8" {
+		t.Fatalf("search = %v", out.Output[0])
+	}
+	if string(out.Output[1]["type"]) != `"function_call"` || string(out.Output[1]["name"]) != `"exec_command"` ||
+		string(out.Output[1]["arguments"]) != `"{\"cmd\":\"sleep 2.0\"}"` {
+		t.Fatalf("another call changed = %v", out.Output[1])
+	}
+}
+
+// dataLines is each data line's JSON of a stream, as written: a number's
+// literal survives here, where a float64 gives 15 back for 15.0.
+func dataLines(t *testing.T, body string) []string {
+	t.Helper()
+	var out []string
+	readSSE(strings.NewReader(body), func(_, data string) error {
+		if data != "" && data != "[DONE]" {
+			out = append(out, data)
+		}
+		return nil
+	})
+	return out
+}
+
+// itemEvent is an event's type and its item, both as they were written.
+type itemEvent struct {
+	Type string                     `json:"type"`
+	Item map[string]json.RawMessage `json:"item"`
+}
+
+// itemsOf is each event of a stream with its item kept as it was written.
+func itemsOf(t *testing.T, body string) []itemEvent {
+	t.Helper()
+	var out []itemEvent
+	for _, data := range dataLines(t, body) {
+		var ev itemEvent
+		if err := json.Unmarshal([]byte(data), &ev); err != nil {
+			t.Fatalf("%v: %s", err, data)
+		}
+		out = append(out, ev)
+	}
+	return out
+}
+
+// Relayed to a Responses API, the search goes as a function and the model's
+// call to it comes back a tool_search_call with integers, before intTidy
+// sees the line.
+func TestSearchTidyGivesTheSearchIntegers(t *testing.T) {
+	in := sse(
+		`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"s7","name":"tool_search","arguments":"{\"query\":\"mail\",\"limit\":8.0}"}}`,
+		`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"c4","name":"exec_command","arguments":"{\"cmd\":\"sleep 2.0\"}"}}`)
+	tidy := searchTidy{grok: true}
+	got := string(tidy.write([]byte(in))) + string(tidy.flush())
+	for _, ev := range itemsOf(t, got) {
+		switch string(ev.Item["call_id"]) {
+		case `"s7"`:
+			args := literals(t, ev.Item["arguments"])
+			if string(ev.Item["type"]) != `"tool_search_call"` || string(ev.Item["execution"]) != `"client"` ||
+				ev.Item["name"] != nil || args["query"] != `"mail"` || args["limit"] != "8" {
+				t.Fatalf("search call = %v", ev.Item)
+			}
+		case `"c4"`:
+			// another tool's arguments are not the search's: as written
+			if string(ev.Item["type"]) != `"function_call"` || string(ev.Item["arguments"]) != `"{\"cmd\":\"sleep 2.0\"}"` {
+				t.Fatalf("another call changed = %v", ev.Item)
+			}
+		default:
+			t.Fatalf("unexpected item = %v", ev.Item)
+		}
+	}
+}
+
+// End to end through the relay chain: a Grok model behind a Responses API
+// is sent the search as a function, and its call to the search comes back
+// a tool_search_call with the integers Codex reads.
+func TestToolSearchRelayedFromGrok(t *testing.T) {
+	f := &fake{reply: sse(
+		`data: {"type":"response.created","response":{"id":"r1","model":"grok-4.6"}}`,
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"s8","name":"tool_search","arguments":""}}`,
+		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"{\"query\":\"mail\",\"limit\":8.0}"}`,
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"s8","name":"tool_search","arguments":"{\"query\":\"mail\",\"limit\":8.0}","status":"completed"}}`,
+		`data: {"type":"response.completed","response":{"id":"r1","output":[{"type":"function_call","call_id":"s8","name":"tool_search","arguments":"{\"query\":\"mail\",\"limit\":8.0}"}],"usage":{"input_tokens":5,"output_tokens":2}}}`)}
+	up := setup(t, provider.Responses, f)
+	if err := provider.Save(provider.Provider{ID: "fake", Name: "Fake", Key: "k", Models: []string{"grok-4.6"}, Responses: up.URL + "/v1"}); err != nil {
+		t.Fatal(err)
+	}
+	code, body := post(t, "/v1/responses", `{"model":"fake/grok-4.6","stream":true,`+searchTools+`,`+searchInput+`}`)
+	if code != 200 {
+		t.Fatalf("%d %s", code, body)
+	}
+	var done int
+	for _, ev := range itemsOf(t, body) {
+		if ev.Type != "response.output_item.done" {
+			continue
+		}
+		done++
+		args := literals(t, ev.Item["arguments"])
+		if string(ev.Item["type"]) != `"tool_search_call"` || string(ev.Item["call_id"]) != `"s8"` ||
+			args["query"] != `"mail"` || args["limit"] != "8" {
+			t.Fatalf("relayed = %v", ev.Item)
+		}
+	}
+	if done != 1 {
+		t.Fatalf("done items = %d: %s", done, body)
+	}
+	var completed struct {
+		Response struct {
+			Output []map[string]json.RawMessage `json:"output"`
+		} `json:"response"`
+	}
+	for _, data := range dataLines(t, body) {
+		var head struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal([]byte(data), &head); err != nil {
+			t.Fatal(err)
+		}
+		if head.Type == "response.completed" {
+			if err := json.Unmarshal([]byte(data), &completed); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if len(completed.Response.Output) != 1 {
+		t.Fatalf("completed output = %s", body)
+	}
+	im := completed.Response.Output[0]
+	if string(im["type"]) != `"tool_search_call"` || literals(t, im["arguments"])["limit"] != "8" {
+		t.Fatalf("completed = %v", im)
 	}
 }

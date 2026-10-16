@@ -136,11 +136,11 @@ func TestCodexCustomToolNamespaced(t *testing.T) {
 	if len(r.Tools) != 2 || r.Tools[0].Name != "mcp__pad__write" || r.Tools[1].Name != "apply_patch" || strings.Contains(r.Tools[0].Description, "grammar") {
 		t.Fatalf("tools: %+v", r.Tools)
 	}
-	item := callTo(map[string]any{"type": "function_call", "call_id": "c", "arguments": `{"input":"x"}`}, "mcp__pad__write", r.Namespaced)
+	item := callTo(map[string]any{"type": "function_call", "call_id": "c", "arguments": `{"input":"x"}`}, "mcp__pad__write", r.Namespaced, false)
 	if item["type"] != "custom_tool_call" || item["name"] != "write" || item["namespace"] != "mcp__pad" || item["input"] != "x" {
 		t.Fatalf("namespaced call: %v", item)
 	}
-	item = callTo(map[string]any{"type": "function_call", "call_id": "c", "arguments": `*** Begin Patch`}, "apply_patch", r.Namespaced)
+	item = callTo(map[string]any{"type": "function_call", "call_id": "c", "arguments": `*** Begin Patch`}, "apply_patch", r.Namespaced, false)
 	if item["type"] != "custom_tool_call" || item["input"] != "*** Begin Patch" || item["namespace"] != nil {
 		t.Fatalf("plain call: %v", item)
 	}
@@ -154,7 +154,7 @@ func TestCodexCustomToolNamespaced(t *testing.T) {
 func renderCall(t *testing.T, named map[string]nsTool) map[string]any {
 	t.Helper()
 	args, _ := json.Marshal(map[string]string{"input": "*** Begin Patch\n*** End Patch"})
-	out := renderResponses(Result{Parts: []Part{{Kind: ToolCall, ID: "c", Name: "apply_patch", Args: args}}}, "m", named)
+	out := renderResponses(Result{Parts: []Part{{Kind: ToolCall, ID: "c", Name: "apply_patch", Args: args}}}, "m", named, false)
 	var res struct {
 		Output []map[string]any `json:"output"`
 	}
